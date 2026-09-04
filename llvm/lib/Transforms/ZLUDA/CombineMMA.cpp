@@ -72,6 +72,18 @@ static IntrinsicInst *getBF16ZludaMMA(Instruction &I) {
   return nullptr;
 }
 
+// The f16 form goes down the same road as bf16: the A, B, C and D conversions are
+// shared, only the AMD instruction differs, and it wants <16 x half> where the bf16
+// one wants <16 x i16>.
+static IntrinsicInst *getF16ZludaMMA(Instruction &I) {
+  auto *MMA = dyn_cast<IntrinsicInst>(&I);
+  if (MMA && MMA->getIntrinsicID() ==
+                 Intrinsic::zluda_mma_m16n8k16_f32_f16_f16_f32) {
+    return MMA;
+  }
+  return nullptr;
+}
+
 static IntrinsicInst *getS8ZludaMMA(Instruction &I) {
   auto *MMA = dyn_cast<IntrinsicInst>(&I);
   if (MMA &&
@@ -183,8 +195,10 @@ bool MMACombiner::combineMMA(IntrinsicInst *First, IntrinsicInst *Second) {
   IRBuilder<> Builder(First);
 
   llvm::Value *Split;
-  if (First->getIntrinsicID() ==
-      Intrinsic::zluda_mma_m16n8k16_f32_bf16_bf16_f32) {
+  bool IsF16 = First->getIntrinsicID() ==
+               Intrinsic::zluda_mma_m16n8k16_f32_f16_f16_f32;
+  if (IsF16 || First->getIntrinsicID() ==
+                   Intrinsic::zluda_mma_m16n8k16_f32_bf16_bf16_f32) {
     auto V4I32Ty = VectorType::get(Builder.getInt32Ty(), 4, /*Scalable=*/false);
     auto V4I32x2Ty = StructType::get(Builder.getContext(), {V4I32Ty, V4I32Ty});
     auto V8I32Ty = VectorType::get(Builder.getInt32Ty(), 8, /*Scalable=*/false);
@@ -202,9 +216,19 @@ bool MMACombiner::combineMMA(IntrinsicInst *First, IntrinsicInst *Second) {
     auto CombinedC = combineC(Builder, FirstCBitCast, SecondCBitCast);
     auto CombinedCBitCast = Builder.CreateBitCast(CombinedC, V8F32Ty);
 
+    llvm::Value *AOperand = ShuffledA;
+    llvm::Value *BOperand = CombinedB;
+    if (IsF16) {
+      auto V16F16Ty =
+          VectorType::get(Builder.getHalfTy(), 16, /*Scalable=*/false);
+      AOperand = Builder.CreateBitCast(ShuffledA, V16F16Ty);
+      BOperand = Builder.CreateBitCast(CombinedB, V16F16Ty);
+    }
     auto *Result = Builder.CreateIntrinsic(
-        V8F32Ty, Intrinsic::amdgcn_wmma_f32_16x16x16_bf16,
-        {ShuffledA, CombinedB, CombinedCBitCast});
+        V8F32Ty,
+        IsF16 ? Intrinsic::amdgcn_wmma_f32_16x16x16_f16
+              : Intrinsic::amdgcn_wmma_f32_16x16x16_bf16,
+        {AOperand, BOperand, CombinedCBitCast});
     auto *ResultBitCast = Builder.CreateBitCast(Result, V8I32Ty);
     Split = Builder.CreateIntrinsic(
         V4I32x2Ty, Intrinsic::zluda_dmatrix_split_nv16x8_amd16x16,
@@ -276,7 +300,8 @@ void MMACombiner::lowerMMA(IntrinsicInst *MMA) {
 
   llvm::Intrinsic::ID IID = MMA->getIntrinsicID();
   auto V4I32Ty = VectorType::get(Builder.getInt32Ty(), 4, /*Scalable=*/false);
-  if (IID == Intrinsic::zluda_mma_m16n8k16_f32_bf16_bf16_f32) {
+  bool IsF16 = IID == Intrinsic::zluda_mma_m16n8k16_f32_f16_f16_f32;
+  if (IsF16 || IID == Intrinsic::zluda_mma_m16n8k16_f32_bf16_bf16_f32) {
     auto V8F32Ty = VectorType::get(Builder.getFloatTy(), 8, /*Scalable=*/false);
     auto V16I16Ty =
         VectorType::get(Builder.getInt16Ty(), 16, /*Scalable=*/false);
@@ -288,9 +313,19 @@ void MMACombiner::lowerMMA(IntrinsicInst *MMA) {
         V16I16Ty, Intrinsic::zluda_bmatrix_concatenate_amd16x16_nv16x8, {B, NullB});
     auto ShuffledC = convertC(Builder, C);
 
+    llvm::Value *AOperand = ShuffledA;
+    llvm::Value *BOperand = ShuffledB;
+    if (IsF16) {
+      auto V16F16Ty =
+          VectorType::get(Builder.getHalfTy(), 16, /*Scalable=*/false);
+      AOperand = Builder.CreateBitCast(ShuffledA, V16F16Ty);
+      BOperand = Builder.CreateBitCast(ShuffledB, V16F16Ty);
+    }
     auto *Output = Builder.CreateIntrinsic(
-        V8F32Ty, Intrinsic::amdgcn_wmma_f32_16x16x16_bf16,
-        {ShuffledA, ShuffledB, ShuffledC});
+        V8F32Ty,
+        IsF16 ? Intrinsic::amdgcn_wmma_f32_16x16x16_f16
+              : Intrinsic::amdgcn_wmma_f32_16x16x16_bf16,
+        {AOperand, BOperand, ShuffledC});
     Result = Builder.CreateIntrinsic(
         V4I32Ty, Intrinsic::zluda_dmatrix_trunc_nv16x8_amd16x16, {Output});
   } else if (IID == Intrinsic::zluda_mma_m16n8k32_s32_s8_s8_s32) {
@@ -349,6 +384,11 @@ bool MMACombiner::combineBB(BasicBlock &BB) {
     auto *BF16MMA = getBF16ZludaMMA(I);
     if (BF16MMA) {
       MMAs.push_back(BF16MMA);
+      continue;
+    }
+    auto *F16MMA = getF16ZludaMMA(I);
+    if (F16MMA) {
+      MMAs.push_back(F16MMA);
       continue;
     }
     auto *S8MMA = getS8ZludaMMA(I);

@@ -6,14 +6,31 @@
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/IntrinsicsAMDGPU.h"
+#include "llvm/Support/raw_ostream.h"
+#include <cstdlib>
 
 using namespace llvm;
+
+// Diagnostic: how many MMAs this pass combines and, where it does not, why not.
+// Reading it decides whether a codegen change actually reached the fusion, which
+// instruction counts alone cannot say -- a fused pair and an unfused single both
+// come out as one AMD 16x16 WMMA, so the counts look the same in both cases.
+//
+// Reached through the environment rather than an LLVM option: passing an option
+// to ZLUDA's argument list makes LLVMZludaParseCommandLineOptions fail before any
+// module compiles, and every cuModuleLoadData then reports an error (see the note
+// in llvm_zluda/src/compile.rs). Off unless ZLUDA_MMA_STATS is set.
+static bool mmaStatsEnabled() {
+  static const bool Enabled = ::getenv("ZLUDA_MMA_STATS") != nullptr;
+  return Enabled;
+}
 
 // Moves the instructions that FromBefore depends on to before ToBefore. Does
 // nothing other than return false if FromBefore has a dependency on ToBefore,
 // and true otherwise. Based on LoadStoreVectorizer's reorder.
 static bool tryToReorderOperands(IntrinsicInst *FromBefore,
-                                 IntrinsicInst *ToBefore) {
+                                 IntrinsicInst *ToBefore,
+                                 const char **Why = nullptr) {
   assert(FromBefore->getParent() == ToBefore->getParent());
 
   SmallPtrSet<Instruction *, 16> InstructionsToMove;
@@ -34,6 +51,8 @@ static bool tryToReorderOperands(IntrinsicInst *FromBefore,
       }
 
       if (Dependency == ToBefore) {
+        if (Why)
+          *Why = "the second MMA depends on the first";
         return false;
       }
 
@@ -43,6 +62,8 @@ static bool tryToReorderOperands(IntrinsicInst *FromBefore,
       if (!Dependency->comesBefore(ToBefore)) {
         // This is conservative
         if (Dependency->mayReadOrWriteMemory()) {
+          if (Why)
+            *Why = "an operand of the second MMA touches memory";
           return false;
         }
         InstructionsToMove.insert(Dependency);
@@ -97,7 +118,8 @@ public:
 private:
   bool combineBB(BasicBlock &BB);
   bool combineMMAs(SmallVectorImpl<IntrinsicInst *> &MMAs);
-  bool combineMMA(IntrinsicInst *First, IntrinsicInst *Second);
+  bool combineMMA(IntrinsicInst *First, IntrinsicInst *Second,
+                  const char **Why = nullptr);
 
   llvm::Value *EmitAmdMmaI8(llvm::IRBuilder<> &Builder, llvm::Value *FirstA,
                             llvm::Value *FirstB, llvm::Value *SecondB,
@@ -109,6 +131,13 @@ private:
   Value *convertC(IRBuilder<> &Builder, Value *C);
 
   SmallVector<Instruction *> MaybeRemove;
+
+  // Counted for -zluda-mma-stats; unread otherwise.
+  unsigned Seen = 0;
+  unsigned Combined = 0;
+  unsigned LoweredNoPartner = 0;
+  unsigned LoweredRefused = 0;
+  const char *LastWhy = nullptr;
 };
 
 // If FirstC and SecondC are the result of a split, return the value before it
@@ -166,7 +195,8 @@ Value *MMACombiner::convertC(IRBuilder<> &Builder, Value *C) {
 
 // Combine two NVIDIA-style 16x8 MMA instructions into one AMD-style 16x16 MMA
 // instruction.
-bool MMACombiner::combineMMA(IntrinsicInst *First, IntrinsicInst *Second) {
+bool MMACombiner::combineMMA(IntrinsicInst *First, IntrinsicInst *Second,
+                             const char **Why) {
   assert(First->getIntrinsicID() == Second->getIntrinsicID());
   Value *FirstA = First->getArgOperand(0);
   Value *FirstB = First->getArgOperand(1);
@@ -177,12 +207,14 @@ bool MMACombiner::combineMMA(IntrinsicInst *First, IntrinsicInst *Second) {
   Value *SecondC = Second->getArgOperand(2);
 
   if (FirstA != SecondA) {
+    if (Why)
+      *Why = "the two MMAs do not share operand A";
     return false;
   }
 
   // We try to move all operands of Second before First. If we cannot, it is
   // because Second has a dependency on first, and we cannot combine them.
-  if (!tryToReorderOperands(Second, First)) {
+  if (!tryToReorderOperands(Second, First, Why)) {
     return false;
   }
 
@@ -346,16 +378,23 @@ bool MMACombiner::combineMMAs(SmallVectorImpl<IntrinsicInst *> &MMAs) {
   llvm::DenseMap<std::pair<llvm::Intrinsic::ID, llvm::Value *>, IntrinsicInst *>
       UncombinedMMAs;
 
+  Seen += (unsigned)MMAs.size();
+
   for (IntrinsicInst *MMA : MMAs) {
     std::pair<llvm::Intrinsic::ID, llvm::Value *> Key{MMA->getIntrinsicID(),
                                                       MMA->getArgOperand(0)};
     IntrinsicInst *CompatibleMMA = UncombinedMMAs.lookup(Key);
     if (CompatibleMMA) {
-      if (combineMMA(CompatibleMMA, MMA)) {
+      const char *Why = nullptr;
+      if (combineMMA(CompatibleMMA, MMA, &Why)) {
+        Combined += 1;
         UncombinedMMAs.erase(Key);
       } else {
         // If we failed that's likely because the MMA #2 depends on MMA #1.
         // In that case we lower MMA #1 and keep MMA #2 for future combinations.
+        LoweredRefused += 1;
+        if (Why)
+          LastWhy = Why;
         lowerMMA(CompatibleMMA);
         UncombinedMMAs.insert_or_assign(Key, MMA);
       }
@@ -364,6 +403,7 @@ bool MMACombiner::combineMMAs(SmallVectorImpl<IntrinsicInst *> &MMAs) {
     }
   }
 
+  LoweredNoPartner += (unsigned)UncombinedMMAs.size();
   for (auto pair : UncombinedMMAs) {
     lowerMMA(pair.second);
   }
@@ -414,6 +454,15 @@ bool MMACombiner::combine(Function &F) {
       I->eraseFromParent();
       Modified = true;
     }
+  }
+
+  if (mmaStatsEnabled() && Seen > 0) {
+    errs() << "[zluda-mma] " << F.getName() << ": saw " << Seen
+           << " intrinsic(s), combined " << Combined << " pair(s), lowered alone "
+           << LoweredNoPartner << ", refused " << LoweredRefused;
+    if (LoweredRefused && LastWhy)
+      errs() << " (" << LastWhy << ")";
+    errs() << "\n";
   }
 
   return Modified;
